@@ -8,7 +8,9 @@
 
 package main
 
-import "container/list"
+import (
+	"container/list"
+)
 
 // CacheSize determines how big the cache can grow
 const CacheSize = 100
@@ -21,37 +23,53 @@ type KeyStoreCacheLoader interface {
 
 // KeyStoreCache is a LRU cache for string key-value pairs
 type KeyStoreCache struct {
-	cache map[string]string
-	pages list.List
-	load  func(string) string
+	cache    map[string]string
+	pages    list.List
+	load     func(string) string
+	request  chan string
+	response chan string
 }
 
 // New creates a new KeyStoreCache
 func New(load KeyStoreCacheLoader) *KeyStoreCache {
 	return &KeyStoreCache{
-		load:  load.Load,
-		cache: make(map[string]string),
+		load:     load.Load,
+		cache:    make(map[string]string),
+		request:  make(chan string),
+		response: make(chan string),
 	}
 }
 
 // Get gets the key from cache, loads it from the source if needed
 func (k *KeyStoreCache) Get(key string) string {
-	val, ok := k.cache[key]
+	k.request <- key
+	return <-k.response
+}
 
-	// Miss - load from database and save it in cache
-	if !ok {
-		val = k.load(key)
-		k.cache[key] = val
-		k.pages.PushFront(key)
+func (k *KeyStoreCache) run(done <-chan bool) {
+	for {
+		select {
+		case <-done:
+			// fmt.Println("run done") // check goroutine leak
+			return
+		case key := <-k.request:
+			val, ok := k.cache[key]
 
-		// if cache is full remove the least used item
-		if len(k.cache) > CacheSize {
-			delete(k.cache, k.pages.Back().Value.(string))
-			k.pages.Remove(k.pages.Back())
+			// Miss - load from database and save it in cache
+			if !ok {
+				val = k.load(key)
+				k.cache[key] = val
+				k.pages.PushFront(key)
+
+				// if cache is full remove the least used item
+				if len(k.cache) > CacheSize {
+					delete(k.cache, k.pages.Back().Value.(string))
+					k.pages.Remove(k.pages.Back())
+				}
+			}
+			k.response <- val
 		}
 	}
-
-	return val
 }
 
 // Loader implements KeyStoreLoader
@@ -74,6 +92,10 @@ func run() *KeyStoreCache {
 		DB: GetMockDB(),
 	}
 	cache := New(&loader)
+
+	done := make(chan bool)
+	defer close(done)
+	go cache.run(done)
 
 	RunMockServer(cache)
 
